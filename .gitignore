@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Ket qua chay thu / tai ra luc su dung app
+observations/
+st.txt
