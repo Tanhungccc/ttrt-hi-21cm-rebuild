@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from numpy import ptp
 
 from ..gain_search import find_optimal_gain
+from ..hardware import probe_sdr
 from ..record_data import record_power_spectrum
 from ..sdr_wrapper import MockRtlSdr
 
@@ -16,32 +17,28 @@ try:
 except Exception:
     RtlSdr = None  # chưa cài pyrtlsdr
 
+VALID_SOURCE_MODES = ("auto", "mock", "real")
+
 
 class _MissingSdr:
-    """Thay thế khi KHÔNG có RTL-SDR thật và KHÔNG --mock: khởi tạo sẽ ném đúng
-    lỗi như app gốc ("Could not open SDR (device index = 0)"), tuyệt đối không
-    lặng lẽ chạy giả lập."""
+    """Thay thế khi KHÔNG có RTL-SDR thật và không fallback mock: khởi tạo sẽ ném đúng
+    lỗi như app gốc ("Could not open SDR (device index = 0)")."""
 
     def __init__(self):
         raise OSError('Could not open SDR (device index = 0) — '
                       'không tìm thấy thiết bị RTL-SDR hoặc thiếu thư viện pyrtlsdr. '
-                      'Cắm USB SDR + cài driver (Zadig), hoặc bật nút MOCK trên thanh công cụ để thử.')
+                      'Cắm USB SDR + cài driver (Zadig), hoặc dùng chế độ Tự động/MOCK.')
 
 
 class ObsManager:
-    """Quản lý việc ghi, lưu và vẽ dữ liệu. Không xử lý ngoại lệ
-    (để caller xử lý) — như bản gốc."""
+    """Quản lý việc ghi, lưu và vẽ dữ liệu; hỗ trợ 3 chế độ nguồn: auto / mock / real."""
 
-    def __init__(self, mock_device: bool = False, n_integrations: int = 25):
-        self.mock_requested = mock_device
-        if mock_device:
-            self.sdr_class = MockRtlSdr
-        elif RtlSdr is not None:
-            self.sdr_class = RtlSdr          # thiết bị thật (lỗi mở thiết bị sẽ nêu rõ)
-        else:
-            self.sdr_class = _MissingSdr     # báo lỗi như app gốc, KHÔNG giả lập
-        self.using_mock = self.sdr_class is MockRtlSdr
-        self.mock_reason = "yêu cầu --mock" if mock_device else ""
+    def __init__(self, mock_device: bool = False, n_integrations: int = 25,
+                 source_mode: Optional[str] = None):
+        if source_mode is None:
+            source_mode = "mock" if mock_device else "auto"
+        if source_mode not in VALID_SOURCE_MODES:
+            raise ValueError(f"source_mode không hợp lệ: {source_mode!r}")
         self.gain: Optional[float] = None
         self.baseline_power_spectrum: Optional[NDArray] = None
         self.last_freq: Optional[NDArray] = None
@@ -51,20 +48,62 @@ class ObsManager:
         self.gain_curve = []                        # (gain, sigma) từ gain search
         self.last_sigma = 0.0                       # sigma lớn nhất lần đo gần nhất
         self.sat_limit = 0.35                       # ngưỡng bão hoà ADC
+        self.last_probe: dict = {}
+        self.set_source_mode(source_mode)
+
+    def probe_hardware(self) -> dict:
+        """Dò SDR đang cắm thật và cập nhật `last_probe`."""
+        self.last_probe = probe_sdr()
+        return self.last_probe
+
+    def _has_usable_rtlsdr(self, probe: dict) -> bool:
+        return bool(probe.get("found") and probe.get("kind") == "rtlsdr" and RtlSdr is not None)
+
+    def set_source_mode(self, mode: str, *, allow_fallback: bool = False):
+        """Đặt chế độ nguồn ('auto' | 'mock' | 'real'). Đổi nguồn = reset hiệu chuẩn."""
+        if mode not in VALID_SOURCE_MODES:
+            raise ValueError(f"source_mode không hợp lệ: {mode!r}")
+        self.source_mode = mode
+        if mode == "mock":
+            self.sdr_class = MockRtlSdr
+            self.mock_reason = "chọn chế độ MOCK"
+        elif mode == "real":
+            probe = self.probe_hardware()
+            self.sdr_class = RtlSdr if self._has_usable_rtlsdr(probe) else _MissingSdr
+            self.mock_reason = ""
+        else:  # auto
+            probe = self.probe_hardware()
+            if self._has_usable_rtlsdr(probe):
+                self.sdr_class = RtlSdr
+                self.mock_reason = ""
+            elif allow_fallback:
+                self.sdr_class = MockRtlSdr
+                self.mock_reason = f"tự động fallback ({probe.get('error') or 'không thấy SDR'})"
+            else:
+                self.sdr_class = _MissingSdr
+                self.mock_reason = ""
+        self.using_mock = self.sdr_class is MockRtlSdr
+        self.mock_requested = (mode == "mock")
+        self.gain = None
+        self.baseline_power_spectrum = None
+
+    def activate_fallback_mock(self, reason: str = "tự động fallback (không thấy SDR)"):
+        """Chuyển sang MockRtlSdr khi chế độ 'auto' không thấy SDR."""
+        self.sdr_class = MockRtlSdr
+        self.using_mock = True
+        self.mock_requested = False
+        self.mock_reason = reason
+        self.gain = None
+        self.baseline_power_spectrum = None
 
     def set_mock(self, enabled: bool):
         """Bật/tắt thiết bị giả lập bằng nút toggle trên thanh công cụ.
         Đổi thiết bị = vô hiệu hoá hiệu chuẩn cũ → phải Chuẩn bị lại."""
         if enabled:
-            self.sdr_class = MockRtlSdr
+            self.set_source_mode("mock")
             self.mock_reason = "bật bằng nút MOCK trên thanh công cụ"
         else:
-            self.sdr_class = RtlSdr if RtlSdr is not None else _MissingSdr
-            self.mock_reason = ""
-        self.using_mock = self.sdr_class is MockRtlSdr
-        self.mock_requested = enabled
-        self.gain = None                       # reset hiệu chuẩn
-        self.baseline_power_spectrum = None
+            self.set_source_mode("auto")
 
     @property
     def ready_to_record(self) -> bool:

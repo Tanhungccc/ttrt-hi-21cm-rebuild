@@ -67,6 +67,10 @@ class English(StrEnum):
     WARN_MOCK_TITLE = "SIMULATION MODE (MOCK)"
     WARN_MOCK_L1 = "No real measurement is being made — the spectra are SIMULATED."
     LBL_ANALYSIS = "Analysis (shift case / pointing / our position)"
+    LBL_HW_CHECK = "Hardware"
+    LBL_SRC_AUTO = "Auto"
+    LBL_SRC_MOCK = "Mock"
+    LBL_SRC_REAL = "Real SDR"
 
 
 class Vietnamese(StrEnum):
@@ -121,6 +125,10 @@ class Vietnamese(StrEnum):
     WARN_MOCK_TITLE = "CHẾ ĐỘ GIẢ LẬP (MOCK)"
     WARN_MOCK_L1 = "KHÔNG có phép đo thật nào diễn ra — phổ hiển thị là GIẢ LẬP."
     LBL_ANALYSIS = "Phân tích (shift / hướng trỏ / vị trí chúng ta)"
+    LBL_HW_CHECK = "Phần cứng"
+    LBL_SRC_AUTO = "Tự động"
+    LBL_SRC_MOCK = "Mô phỏng"
+    LBL_SRC_REAL = "SDR thật"
 
 
 SUPPORTED_LANGUAGES = {lang.NAME: lang for lang in (English, Vietnamese)}

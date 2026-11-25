@@ -29,13 +29,15 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import numpy as np
 import tkinter as tk
 import tkinter.font
+import tkinter.messagebox as messagebox
+import tkinter.ttk as ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-from skao_trt import analysis, data_io
+from skao_trt import analysis, data_io, hardware
 from skao_trt.apps.languages import SUPPORTED_LANGUAGES
 from skao_trt.apps.obs_manager import ObsManager
 from skao_trt.constants import HI_FREQ_MHZ, SKAO_BLUE, SKAO_MAGENTA
@@ -174,7 +176,8 @@ class TabletopApp:
     thêm ô nhập hướng trỏ và bảng phân tích sau mỗi phép đo."""
 
     def __init__(self, width: int = 1024, mock: bool = False, demo: bool = False,
-                 language: str = "English", n_integrations: int = 25):
+                 language: str = "English", n_integrations: int = 25,
+                 source_mode: str | None = None):
         self.lang = SUPPORTED_LANGUAGES[language]
         self.demo = demo
         self.root = tk.Tk()
@@ -196,10 +199,12 @@ class TabletopApp:
         ], self.font)
         self.buttons_bar.dispose()  # bản gốc: dispose() = finalize/pack layout
         self.status_bar = StatusBar(self.root, self.lang.READY, self.font)
-        self.obs_manager = ObsManager(mock_device=mock, n_integrations=n_integrations)
+        self.obs_manager = ObsManager(mock_device=mock, n_integrations=n_integrations,
+                                      source_mode=source_mode)
         self.obs_manager.on_progress = None
         self.is_mock = self.obs_manager.using_mock
         self._create_mock_toggle()
+        self.refresh_hw_status()
         self._update_title()
         if self.is_mock:
             self.update_status(f"⚠ {self.lang.WARN_MOCK_TITLE} — {self.obs_manager.mock_reason}")
@@ -241,9 +246,29 @@ class TabletopApp:
                   font=self.font).pack(side=tk.LEFT, padx=4)
         tk.Button(row2, text=L.LBL_LOAD, command=self.load_data,
                   font=self.font).pack(side=tk.LEFT, padx=4)
+        tk.Button(row2, text=L.LBL_HW_CHECK, command=self.show_hardware_status,
+                  font=self.font).pack(side=tk.LEFT, padx=4)
 
     def _create_mock_toggle(self):
-        """Nút toggle trên thanh công cụ đồ thị: MOCK + NÂNG CAO (v_LSR + đỉnh)."""
+        """Nút toggle trên thanh công cụ đồ thị: Nguồn (Auto/Mock/Real) + MOCK + RAW."""
+        L = self.lang
+        self._src_labels = {
+            "auto": L.LBL_SRC_AUTO,
+            "mock": L.LBL_SRC_MOCK,
+            "real": L.LBL_SRC_REAL,
+        }
+        self.source_var = tk.StringVar(value=self._src_labels[self.obs_manager.source_mode])
+        self.source_combo = ttk.Combobox(
+            self.interactive_figure.navbar, textvariable=self.source_var,
+            values=list(self._src_labels.values()), state="readonly", width=10,
+            font=self.font)
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_source_changed())
+        self.source_combo.pack(side=tk.RIGHT, padx=4)
+
+        self.hw_label = tk.Label(
+            self.interactive_figure.navbar, text="", bg="white", font=self.font)
+        self.hw_label.pack(side=tk.RIGHT, padx=6)
+
         self.mock_var = tk.BooleanVar(value=self.is_mock)
         self.mock_toggle = tk.Checkbutton(
             self.interactive_figure.navbar, text=self.lang.LBL_MOCK_TOGGLE,
@@ -260,6 +285,52 @@ class TabletopApp:
         self.raw_toggle.pack(side=tk.RIGHT, padx=8)
         self._last_plot = None
 
+    def _source_key(self) -> str:
+        txt = self.source_var.get()
+        for k, v in self._src_labels.items():
+            if v == txt:
+                return k
+        return "auto"
+
+    def refresh_hw_status(self) -> dict:
+        """Dò SDR và cập nhật nhãn trạng thái (🟢 thật / 🟡 mô phỏng / 🔴 thiếu)."""
+        probe = self.obs_manager.probe_hardware()
+        mode = self.obs_manager.source_mode
+        if self.obs_manager.using_mock:
+            text, col = "🟡 MOCK", "#b36b00"
+        elif self.obs_manager._has_usable_rtlsdr(probe):
+            tun = f" ({probe['tuner']})" if probe.get("tuner") else ""
+            text, col = f"🟢 {probe['name']}{tun}", "#1a7f37"
+        elif mode == "real":
+            text, col = "🔴 Không có SDR", "#c62828"
+        else:
+            text, col = "🟡 Tự động → fallback MOCK", "#b36b00"
+        self.hw_label.configure(text=text, fg=col)
+        return probe
+
+    def show_hardware_status(self):
+        """Hiển thị kết quả dò SDR, chuỗi thu dự phòng (detect_chain) và hồ sơ POAM."""
+        probe = self.refresh_hw_status()
+        chain = hardware.detect_chain(goal="hi", probe=probe)
+        lines = [
+            f"SDR probe: {hardware.probe_summary()}",
+            f"Chế độ nguồn: {self.obs_manager.source_mode}",
+            "",
+            *chain.summary().splitlines(),
+            "",
+            *hardware.poam_profile_summary().splitlines(),
+        ]
+        self._show(lines, title=self.lang.LBL_HW_CHECK)
+
+    def on_source_changed(self):
+        mode = self._source_key()
+        self.obs_manager.set_source_mode(mode)
+        self.is_mock = self.obs_manager.using_mock
+        self.mock_var.set(self.is_mock)
+        self.refresh_hw_status()
+        self._update_title()
+        self.update_status(f"Nguồn dữ liệu: {self._src_labels[mode]} — bấm Chuẩn bị")
+
     def toggle_view(self):
         """RAW (chưa xử lý) ON = phổ thô như app gốc; OFF (mặc định) = view
         khoa học: tích hợp + khử nền + Gaussian smooth + v_LSR + dò đỉnh."""
@@ -275,6 +346,8 @@ class TabletopApp:
             return
         self.obs_manager.set_mock(want)
         self.is_mock = self.obs_manager.using_mock
+        self.source_var.set(self._src_labels[self.obs_manager.source_mode])
+        self.refresh_hw_status()
         self._update_title()
         if self.is_mock:
             self.update_status(f"⚠ ĐÃ BẬT {self.lang.WARN_MOCK_TITLE} — phải bấm Chuẩn bị lại")
@@ -282,9 +355,9 @@ class TabletopApp:
                         "Bấm Chuẩn bị để chạy với thiết bị GIẢ LẬP."],
                        title=self.lang.WARN_MOCK_TITLE)
         else:
-            self.update_status("Đã TẮT mock — cần thiết bị THẬT; bấm Chuẩn bị lại")
-            self._show(["Chế độ thiết bị THẬT. Cắm RTL-SDR rồi bấm Chuẩn bị.",
-                        "Không có thiết bị → báo lỗi 'Could not open SDR' (như app gốc)."],
+            self.update_status("Chế độ Tự động — ưu tiên SDR thật, bấm Chuẩn bị lại")
+            self._show(["Chế độ Tự động: ưu tiên RTL-SDR thật; nếu không thấy sẽ hỏi fallback MOCK.",
+                        "Muốn bắt buộc SDR thật (báo lỗi nếu thiếu), chọn 'SDR thật'."],
                        title=self.lang.READY)
 
     def _update_title(self):
@@ -321,6 +394,27 @@ class TabletopApp:
     def prepare(self):
         L = self.lang
         try:
+            probe = self.refresh_hw_status()
+            if self.obs_manager.source_mode == "auto" and not self.obs_manager.using_mock:
+                if not self.obs_manager._has_usable_rtlsdr(probe):
+                    ok = messagebox.askokcancel(
+                        "Không thấy RTL-SDR — chạy MÔ PHỎNG (fallback)?",
+                        "\n".join([
+                            f"Không tìm thấy RTL-SDR ({probe.get('error') or 'không rõ lý do'}).",
+                            "",
+                            "OK = Tự động chuyển sang MÔ PHỎNG (MOCK) để thử quy trình",
+                            "Cancel = Dừng lại để cắm thiết bị / cài driver Zadig",
+                        ]))
+                    if not ok:
+                        self.update_status("Đã huỷ Chuẩn bị — chưa có RTL-SDR")
+                        return
+                    self.obs_manager.activate_fallback_mock(
+                        f"tự động fallback ({probe.get('error') or 'không thấy SDR'})")
+                    self.is_mock = True
+                    self.mock_var.set(True)
+                    self.refresh_hw_status()
+                    self._update_title()
+
             self.update_status(L.PREP_START_STATUS)
             self._show([L.PREP_STEP1_L1, L.PREP_STEP1_L2], title=L.PREP_STEP1_TITLE)
 
@@ -339,7 +433,8 @@ class TabletopApp:
             self.update_status(L.PREP_BASELINE_STATUS)
             self.obs_manager.record_baseline_power_spectrum(SAMPLE_RATE, CENTER_FREQ)
             self.update_status(L.PREP_DONE_STATUS)
-            diag = analysis.chain_report(gain_curve=self.obs_manager.gain_curve)
+            diag = (analysis.chain_report(gain_curve=self.obs_manager.gain_curve)
+                    + [""] + hardware.detect_chain(goal="hi", probe=probe).summary().splitlines())
             self._show(
                 [L.PREP_COMPLETE_L1.format(gain=self.obs_manager.gain),
                  L.PREP_COMPLETE_L2, L.PREP_COMPLETE_L3, L.PREP_COMPLETE_L4,
@@ -708,6 +803,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--mock", action="store_true", help="dùng MockRtlSdr (không cần RTL-SDR)")
+    p.add_argument("--real", action="store_true", help="bắt buộc RTL-SDR thật (không fallback mock)")
     p.add_argument("--demo", action="store_true", help="phổ giả lập theo (l,b)")
     p.add_argument("--selftest", action="store_true", help="chạy pipeline không cần GUI")
     p.add_argument("--data", type=str, default=None,
@@ -759,6 +855,19 @@ def selftest():
         off = min(abs(m - p.v_lsr) for m in mx) / dv_chan
         assert off <= 0.5, f"selftest: marker lệch {off:.2f} kênh tại v={p.v_lsr}"
     print("Marker alignment: OK (≤0.5 kênh)")
+    # --- kiểm tra dò phần cứng & fallback chuỗi thu ---
+    probe = hardware.probe_sdr()
+    assert "found" in probe, "selftest: probe_sdr thiếu khoá 'found'"
+    ch = hardware.detect_chain(goal="hi", probe=probe)
+    assert 60 < ch.t_sys_k < 250, f"selftest: T_sys 1420 MHz bất thường: {ch.t_sys_k}"
+    ch_fb = hardware.detect_chain(have={"lna": "rtl_internal"}, probe=probe)
+    assert ch_fb.t_sys_k > 800 and "lna" in ch_fb.fallbacks, "selftest: fallback LNA nội sai"
+    assert "POAM RTP-3.7" in hardware.poam_profile_summary(), "selftest: thiếu hồ sơ POAM"
+    mgr_auto = ObsManager(source_mode="auto")
+    if not mgr_auto.using_mock and not mgr_auto._has_usable_rtlsdr(mgr_auto.last_probe):
+        mgr_auto.activate_fallback_mock("selftest")
+        assert mgr_auto.using_mock, "selftest: auto fallback không kích hoạt MockRtlSdr"
+    print("Hardware probe & fallback: OK")
     print("=== SELFTEST OK ===")
 
 
@@ -767,8 +876,10 @@ def main():
     if args.selftest:
         selftest()
         return
+    src_mode = "mock" if args.mock else ("real" if args.real else "auto")
     app = TabletopApp(width=args.width, mock=args.mock, demo=args.demo,
-                      language=args.language, n_integrations=args.nint)
+                      language=args.language, n_integrations=args.nint,
+                      source_mode=src_mode)
     if args.data:
         app.root.after(200, lambda: app.load_data(args.data))
     app.run()
